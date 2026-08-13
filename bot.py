@@ -68,11 +68,25 @@ async def check_user_subscriptions(user_id: int) -> list:
     not_subscribed = []
     for ch in channels:
         try:
-            member = await bot.get_chat_member(chat_id=ch['channel_id'], user_id=user_id)
+            raw_cid = ch['channel_id']
+            # Если ID состоит из цифр (и возможного знака минус), приводим его к int
+            if isinstance(raw_cid, str) and (raw_cid.startswith('-') and raw_cid[1:].isdigit() or raw_cid.isdigit()):
+                chat_id = int(raw_cid)
+            else:
+                chat_id = raw_cid
+
+            member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+
+            # Логируем статус для отладки
+            logging.info(f"Статус юзера {user_id} в канале {chat_id}: {member.status}")
+
             if member.status not in ['creator', 'administrator', 'member']:
                 not_subscribed.append(ch)
-        except Exception:
+        except Exception as e:
+            # Выводим точную ошибку в консоль/логи Render, чтобы сразу увидеть проблему
+            logging.error(f"Ошибка проверки подписки для канала {ch.get('channel_id')}: {e}")
             not_subscribed.append(ch)
+
     return not_subscribed
 
 
