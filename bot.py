@@ -16,7 +16,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 
-# Чтение ADMIN_IDS из .env (пример формата в .env: ADMIN_IDS=6269651064,8654315021)
+# Чтение ADMIN_IDS из .env
 raw_admin_ids = os.getenv('ADMIN_IDS', '')
 ADMIN_IDS = [int(x.strip()) for x in raw_admin_ids.split(',') if x.strip().isdigit()]
 
@@ -26,6 +26,9 @@ dp = Dispatcher()
 
 DOWNLOAD_PATH = './downloads'
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
+
+# Проверяем наличие файла cookies.txt в корне проекта или в Secret Files Render
+COOKIES_FILE = 'cookies.txt' if os.path.exists('cookies.txt') else None
 
 
 # --- HTTP Server для обхода таймаутов Render (Health Check) ---
@@ -69,21 +72,17 @@ async def check_user_subscriptions(user_id: int) -> list:
     for ch in channels:
         try:
             raw_cid = ch['channel_id']
-            # Если ID состоит из цифр (и возможного знака минус), приводим его к int
             if isinstance(raw_cid, str) and (raw_cid.startswith('-') and raw_cid[1:].isdigit() or raw_cid.isdigit()):
                 chat_id = int(raw_cid)
             else:
                 chat_id = raw_cid
 
             member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-
-            # Логируем статус для отладки
             logging.info(f"Статус юзера {user_id} в канале {chat_id}: {member.status}")
 
             if member.status not in ['creator', 'administrator', 'member']:
                 not_subscribed.append(ch)
         except Exception as e:
-            # Выводим точную ошибку в консоль/логи Render, чтобы сразу увидеть проблему
             logging.error(f"Ошибка проверки подписки для канала {ch.get('channel_id')}: {e}")
             not_subscribed.append(ch)
 
@@ -272,7 +271,7 @@ async def admin_limit_process(message: types.Message, state: FSMContext):
     try:
         uid, lim = [int(x.strip()) for x in message.text.split("|")]
         await db.set_user_limit(uid, lim)
-        await message.answer(f"✅ Для пользователя `{uid}` устанволен лимит: {lim} скачиваний/день.",
+        await message.answer(f"✅ Для пользователя `{uid}` установлен лимит: {lim} скачиваний/день.",
                              reply_markup=get_admin_main_kb())
     except Exception:
         await message.answer("❌ Ошибка формата.", reply_markup=get_admin_main_kb())
@@ -368,7 +367,6 @@ async def process_type_choice(callback: types.CallbackQuery, state: FSMContext):
         try:
             loop = asyncio.get_running_loop()
             file_path = await loop.run_in_executor(None, download_media, url, opts)
-            # Если расширение изменилось после конвертации
             if not file_path.endswith('.mp3'):
                 file_path = file_path.rsplit('.', 1)[0] + '.mp3'
 
@@ -382,7 +380,6 @@ async def process_type_choice(callback: types.CallbackQuery, state: FSMContext):
         await state.clear()
 
     elif download_type == "video":
-        # Предлагаем выбор качества
         builder = InlineKeyboardBuilder()
         builder.button(text="1080p", callback_data="qual:1080")
         builder.button(text="720p", callback_data="qual:720")
@@ -417,7 +414,6 @@ async def process_quality_choice(callback: types.CallbackQuery, state: FSMContex
                                          reply_markup=builder.as_markup())
         await state.set_state(DownloadState.waiting_for_audio_choice)
     else:
-        # 1 аудиодорожка - запускаем загрузку
         await download_and_send_video(callback.message, state, audio_format_id=None)
 
 
@@ -476,14 +472,18 @@ async def download_and_send_video(message: types.Message, state: FSMContext, aud
     await state.clear()
 
 
-# --- Хелперы ---
+# --- Хелперы с поддержкой cookies.txt ---
 
 def extract_info(url, opts):
+    if COOKIES_FILE:
+        opts['cookiefile'] = COOKIES_FILE
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
 
 def download_media(url, opts):
+    if COOKIES_FILE:
+        opts['cookiefile'] = COOKIES_FILE
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
