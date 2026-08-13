@@ -1,6 +1,8 @@
 import os
 import asyncio
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
@@ -13,7 +15,10 @@ import db
 load_dotenv()
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-ADMIN_IDS = [6269651064,8654315021]
+
+# Чтение ADMIN_IDS из .env (пример формата в .env: ADMIN_IDS=6269651064,8654315021)
+raw_admin_ids = os.getenv('ADMIN_IDS', '')
+ADMIN_IDS = [int(x.strip()) for x in raw_admin_ids.split(',') if x.strip().isdigit()]
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -22,6 +27,26 @@ dp = Dispatcher()
 DOWNLOAD_PATH = './downloads'
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
 
+
+# --- HTTP Server для обхода таймаутов Render (Health Check) ---
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Dubload Bot is running!")
+
+    def log_message(self, format, *args):
+        return  # Отключаем логирование HTTP-запросов в консоль
+
+
+def start_health_check_server():
+    port = int(os.getenv("PORT", 10000))  # Render передает свой порт
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server.serve_forever()
+
+
+# --- Состояния FSM ---
 
 class DownloadState(StatesGroup):
     waiting_for_format = State()
@@ -468,6 +493,9 @@ def get_audio_tracks(formats):
 
 
 async def main():
+    # Запуск фонового веб-сервера для Render
+    threading.Thread(target=start_health_check_server, daemon=True).start()
+
     await db.init_db()
     await dp.start_polling(bot)
 
