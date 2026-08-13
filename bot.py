@@ -324,7 +324,12 @@ async def handle_media_request(message: types.Message, state: FSMContext):
     status_msg = await message.answer("🔍 Анализирую видео...")
     try:
         loop = asyncio.get_running_loop()
-        info = await loop.run_in_executor(None, extract_info, url, {'quiet': True})
+        info = await loop.run_in_executor(None, extract_info, url, {
+            'quiet': True,
+            'skip_download': True,
+            'extract_flat': False,
+            'no_warnings': True,
+        })
 
         await state.update_data(video_url=url, video_info=info)
 
@@ -475,9 +480,10 @@ async def download_and_send_video(message: types.Message, state: FSMContext, aud
 # --- Хелперы с поддержкой cookies.txt ---
 
 def extract_info(url, opts):
+    y_opts = opts.copy() if opts else {}
     if COOKIES_FILE:
-        opts['cookiefile'] = COOKIES_FILE
-    with yt_dlp.YoutubeDL(opts) as ydl:
+        y_opts['cookiefile'] = COOKIES_FILE
+    with yt_dlp.YoutubeDL(y_opts) as ydl:
         return ydl.extract_info(url, download=False)
 
 
