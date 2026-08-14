@@ -33,18 +33,32 @@ def prepare_cookies():
     tmp_path = '/tmp/cookies.txt'
     local_path = 'cookies.txt'
 
+    target_path = None
     if os.path.exists(secret_path):
+        target_path = secret_path
+    elif os.path.exists(local_path):
+        target_path = local_path
+
+    if target_path:
         try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            shutil.copy(secret_path, tmp_path)
-            logging.info("Файл cookies.txt успешно скопирован из /etc/secrets/ в /tmp/")
+            # Читаем файл и принудительно нормализуем переносы строк на Unix-формат (\n)
+            with open(target_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+
+            # Заменяем Windows CRLF (\r\n) на Linux LF (\n)
+            content = content.replace('\r\n', '\n')
+
+            # Перезаписываем во временный файл в /tmp/
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+
+            logging.info(f"✅ Файл cookies.txt обработан и записан в /tmp/ (Размер: {len(content)} символов)")
             return tmp_path
         except Exception as e:
-            logging.error(f"Ошибка копирования cookies из /etc/secrets/: {e}")
+            logging.error(f"❌ Ошибка обработки cookies: {e}")
             return None
-    elif os.path.exists(local_path):
-        return local_path
+
+    logging.warning("⚠️ Файл cookies.txt не найден!")
     return None
 
 COOKIES_FILE = prepare_cookies()
@@ -506,6 +520,9 @@ async def download_and_send_video(message: types.Message, state: FSMContext, aud
         await state.clear()
 
 
+# Задаем User-Agent современного браузера Chrome
+USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36'
+
 YOUTUBE_EXTRACTOR_ARGS = {
     'youtube': {
         'player_client': ['android', 'ios', 'mweb'],
@@ -518,6 +535,7 @@ def extract_info(url, opts):
     y_opts.pop('format', None)
 
     y_opts['extractor_args'] = YOUTUBE_EXTRACTOR_ARGS
+    y_opts['user_agent'] = USER_AGENT
 
     if COOKIES_FILE:
         y_opts['cookiefile'] = COOKIES_FILE
@@ -529,6 +547,7 @@ def extract_info(url, opts):
 def download_media(url, opts):
     opts_copy = opts.copy()
     opts_copy['extractor_args'] = YOUTUBE_EXTRACTOR_ARGS
+    opts_copy['user_agent'] = USER_AGENT
 
     if COOKIES_FILE:
         opts_copy['cookiefile'] = COOKIES_FILE
@@ -541,7 +560,6 @@ def download_media(url, opts):
             base = os.path.splitext(filename)[0]
             filename = f"{base}.{ext}"
         return filename
-
 
 def get_audio_tracks(formats):
     tracks = []
