@@ -473,12 +473,22 @@ async def download_and_send_video(message: types.Message, state: FSMContext, aud
     video_fmt = f"bestvideo[height<={quality}]"
     audio_fmt = f"+{audio_format_id}" if audio_format_id else "+bestaudio"
 
+    # Гибкий селектор форматов: пробует собрать лучшее видео+аудио,
+    # а если не выходит — берет готовое видео с аудио или любое доступное
+    format_selector = (
+        f"{video_fmt}{audio_fmt}/"
+        f"bestvideo[height<={quality}]+bestaudio/"
+        f"best[height<={quality}]/"
+        f"b/best"
+    )
+
     opts = {
         'outtmpl': os.path.join(DOWNLOAD_PATH, f"%(id)s.%(ext)s"),
-        'format': f"{video_fmt}{audio_fmt}/bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best",
+        'format': format_selector,
         'merge_output_format': 'mp4',
         'quiet': True,
     }
+    # ... оставшаяся часть функции без изменений
 
     file_path = None
     try:
@@ -525,15 +535,16 @@ USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 
 YOUTUBE_EXTRACTOR_ARGS = {
     'youtube': {
-        'player_client': ['android', 'ios', 'mweb'],
-        'skip': ['webpage']
+        'player_client': ['android', 'ios', 'mweb', 'tv', 'web'],
     }
 }
 
+
 def extract_info(url, opts):
     y_opts = opts.copy() if opts else {}
-    y_opts.pop('format', None)
 
+    # Не запрашиваем конкретный формат при анализе метаданных
+    y_opts['format'] = 'best'
     y_opts['extractor_args'] = YOUTUBE_EXTRACTOR_ARGS
     y_opts['user_agent'] = USER_AGENT
 
