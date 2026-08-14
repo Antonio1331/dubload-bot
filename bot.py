@@ -2,14 +2,13 @@ import os
 import asyncio
 import logging
 import threading
-import shutil
+import aiohttp
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
-import yt_dlp
 from dotenv import load_dotenv
 import db
 
@@ -21,56 +20,20 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 raw_admin_ids = os.getenv('ADMIN_IDS', '')
 ADMIN_IDS = [int(x.strip()) for x in raw_admin_ids.split(',') if x.strip().isdigit()]
 
+COBALT_API_URL = "https://api.cobalt.tools"
+
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-DOWNLOAD_PATH = './downloads'
-os.makedirs(DOWNLOAD_PATH, exist_ok=True)
 
-def prepare_cookies():
-    secret_path = '/etc/secrets/cookies.txt'
-    tmp_path = '/tmp/cookies.txt'
-    local_path = 'cookies.txt'
-
-    target_path = None
-    if os.path.exists(secret_path):
-        target_path = secret_path
-    elif os.path.exists(local_path):
-        target_path = local_path
-
-    if target_path:
-        try:
-            # Читаем файл и принудительно нормализуем переносы строк на Unix-формат (\n)
-            with open(target_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-
-            # Заменяем Windows CRLF (\r\n) на Linux LF (\n)
-            content = content.replace('\r\n', '\n')
-
-            # Перезаписываем во временный файл в /tmp/
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-
-            logging.info(f"✅ Файл cookies.txt обработан и записан в /tmp/ (Размер: {len(content)} символов)")
-            return tmp_path
-        except Exception as e:
-            logging.error(f"❌ Ошибка обработки cookies: {e}")
-            return None
-
-    logging.warning("⚠️ Файл cookies.txt не найден!")
-    return None
-
-COOKIES_FILE = prepare_cookies()
-
-
-# --- HTTP Server для обхода таймаутов Render (Health Check) ---
+# --- HTTP Server для Health Check (Render) ---
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Dubload Bot is running!")
+        self.wfile.write(b"Dubload Bot is running via Cobalt!")
 
     def log_message(self, format, *args):
         return
@@ -97,7 +60,35 @@ class AdminState(StatesGroup):
     waiting_for_limit_data = State()
 
 
-# --- Вспомогательные функции подписки ---
+# --- Взаимодействие с Cobalt API ---
+
+async def request_cobalt(url: str, is_audio_only: bool = False, quality: str = "720", audio_lang: str = "ru"):
+    """
+    Отправляет запрос к Cobalt API и возвращает структуру ответа.
+    """
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "url": url,
+        "videoQuality": quality if not is_audio_only else "720",
+        "downloadMode": "audio" if is_audio_only else "auto",
+        "youtubeAudioLanguage": audio_lang,  # Выбор языковой аудиодорожки
+    }
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(COBALT_API_URL, json=payload, headers=headers, timeout=35) as resp:
+                data = await resp.json()
+                return data
+        except Exception as e:
+            logging.error(f"Ошибка обращения к Cobalt API: {e}")
+            return None
+
+
+# --- Проверка подписок и Клавиатуры ---
 
 async def check_user_subscriptions(user_id: int) -> list:
     channels = await db.get_channels()
@@ -142,7 +133,7 @@ def get_admin_main_kb():
     return builder.as_markup(resize_keyboard=True)
 
 
-# --- Старт и проверка подписки ---
+# --- Старт и Проверка подписки ---
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -160,7 +151,7 @@ async def cmd_start(message: types.Message):
         "🎧 **Добро пожаловать в Dubload!**\n"
         "Первый бот для скачивания видео с выбором **языковой аудиодорожки**.\n\n"
         "📌 **Что я умею:**\n"
-        "• 🎬 **YouTube:** Скачивание с выбором дубляжа (RU/EN/ES...) и качества.\n"
+        "• 🎬 **YouTube:** Скачивание с выбором дубляжа и качества.\n"
         "• 🎵 **MP3:** Извлечение аудиофайла из любого видео.\n"
         "• 📱 **TikTok:** Мгновенная загрузка без водяных знаков.\n\n"
         "🎁 У тебя есть **5 бесплатных загрузок** каждые 24 часа.\n"
@@ -309,7 +300,7 @@ async def admin_limit_process(message: types.Message, state: FSMContext):
     await state.clear()
 
 
-# --- Обработка TikTok и YouTube ---
+# --- Основная обработка медиа ссылок ---
 
 @dp.message(F.text.contains("tiktok.com") | F.text.contains("youtube.com") | F.text.contains("youtu.be"))
 async def handle_media_request(message: types.Message, state: FSMContext):
@@ -335,51 +326,34 @@ async def handle_media_request(message: types.Message, state: FSMContext):
     # TikTok
     if "tiktok.com" in url:
         status_msg = await message.answer("⏳ Скачиваю TikTok...")
-        out_tmpl = os.path.join(DOWNLOAD_PATH, f"%(id)s.%(ext)s")
-        ydl_opts = {'outtmpl': out_tmpl, 'format': 'b', 'quiet': True}
-        file_path = None
-        try:
-            loop = asyncio.get_running_loop()
-            file_path = await loop.run_in_executor(None, download_media, url, ydl_opts)
-            await status_msg.edit_text("⬆️ Отправляю...")
-            await message.answer_video(video=types.FSInputFile(file_path))
-            await db.increment_user_downloads(message.from_user.id)
-            await status_msg.delete()
-        except Exception as e:
-            await status_msg.edit_text(f"❌ Ошибка TikTok: {e}")
-        finally:
-            if file_path and os.path.exists(file_path):
-                os.remove(file_path)
+        res = await request_cobalt(url)
+        if res and res.get("status") in ["tunnel", "redirect"]:
+            try:
+                await message.answer_video(video=res.get("url"))
+                await db.increment_user_downloads(message.from_user.id)
+                await status_msg.delete()
+            except Exception:
+                await status_msg.edit_text(f"🔗 **Ссылка для скачивания TikTok:**\n{res.get('url')}")
+        else:
+            await status_msg.edit_text("❌ Не удалось загрузить видео из TikTok.")
         return
 
     # YouTube
-    status_msg = await message.answer("🔍 Анализирую видео...")
-    try:
-        loop = asyncio.get_running_loop()
-        info = await loop.run_in_executor(None, extract_info, url, {
-            'quiet': True,
-            'skip_download': True,
-            'extract_flat': False,
-            'no_warnings': True,
-        })
+    await state.update_data(video_url=url)
 
-        await state.update_data(video_url=url, video_info=info)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🎬 Видео", callback_data="type:video")
+    builder.button(text="🎵 Только MP3", callback_data="type:mp3")
+    builder.adjust(2)
 
-        builder = InlineKeyboardBuilder()
-        builder.button(text="🎬 Видео", callback_data="type:video")
-        builder.button(text="🎵 Только MP3", callback_data="type:mp3")
-        builder.adjust(2)
-
-        await status_msg.edit_text(
-            f"🎥 **{info.get('title', 'YouTube Video')}**\n\n"
-            f"📊 Осталось скачиваний на сегодня: **{left}** из **{total}**\n"
-            "Что вы хотите скачать?",
-            reply_markup=builder.as_markup(),
-            parse_mode="Markdown"
-        )
-        await state.set_state(DownloadState.waiting_for_format)
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Ошибка анализа YouTube: {e}")
+    await message.answer(
+        f"🎥 **YouTube Video**\n\n"
+        f"📊 Осталось скачиваний на сегодня: **{left}** из **{total}**\n"
+        "Что вы хотите скачать?",
+        reply_markup=builder.as_markup(),
+        parse_mode="Markdown"
+    )
+    await state.set_state(DownloadState.waiting_for_format)
 
 
 @dp.callback_query(DownloadState.waiting_for_format, F.data.startswith("type:"))
@@ -387,37 +361,23 @@ async def process_type_choice(callback: types.CallbackQuery, state: FSMContext):
     download_type = callback.data.split(":")[1]
     data = await state.get_data()
     url = data['video_url']
-    info = data['video_info']
 
     if download_type == "mp3":
-        await callback.message.edit_text("⏳ Скачиваю и конвертирую в MP3...")
-        opts = {
-            'outtmpl': os.path.join(DOWNLOAD_PATH, f"%(id)s.%(ext)s"),
-            'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-            'quiet': True,
-        }
-        file_path = None
-        try:
-            loop = asyncio.get_running_loop()
-            file_path = await loop.run_in_executor(None, download_media, url, opts)
-            if not file_path.endswith('.mp3'):
-                file_path = file_path.rsplit('.', 1)[0] + '.mp3'
+        await callback.message.edit_text("⏳ Получаю аудио через Cobalt...")
+        res = await request_cobalt(url, is_audio_only=True)
 
+        if res and res.get("status") in ["tunnel", "redirect"]:
             await callback.message.edit_text("⬆️ Отправляю аудио...")
-            await callback.message.answer_audio(audio=types.FSInputFile(file_path), title=info.get('title'))
-            await db.increment_user_downloads(callback.from_user.id)
-            await callback.message.delete()
-        except Exception as e:
-            await callback.message.edit_text(f"❌ Ошибка скачивания MP3: {e}")
-        finally:
-            if file_path and os.path.exists(file_path):
-                os.remove(file_path)
-            await state.clear()
+            try:
+                await callback.message.answer_audio(audio=res.get("url"))
+                await db.increment_user_downloads(callback.from_user.id)
+                await callback.message.delete()
+            except Exception:
+                await callback.message.edit_text(f"🔗 **Ссылка на MP3:**\n{res.get('url')}")
+        else:
+            await callback.message.edit_text("❌ Ошибка при получении MP3.")
+
+        await state.clear()
 
     elif download_type == "video":
         builder = InlineKeyboardBuilder()
@@ -436,167 +396,54 @@ async def process_type_choice(callback: types.CallbackQuery, state: FSMContext):
 async def process_quality_choice(callback: types.CallbackQuery, state: FSMContext):
     quality = callback.data.split(":")[1]
     await state.update_data(chosen_quality=quality)
-    data = await state.get_data()
-    info = data['video_info']
 
-    audio_tracks = get_audio_tracks(info.get('formats', []))
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🇷🇺 Русский", callback_data="audio:ru")
+    builder.button(text="🇬🇧 Английский", callback_data="audio:en")
+    builder.button(text="🇪🇸 Испанский", callback_data="audio:es")
+    builder.button(text="⚙️ По умолчанию", callback_data="audio:default")
+    builder.adjust(2)
 
-    if len(audio_tracks) > 1:
-        builder = InlineKeyboardBuilder()
-        for track in audio_tracks:
-            lang_label = track['language']
-            if track['is_original']:
-                lang_label += " (Оригинал)"
-            builder.button(text=lang_label, callback_data=f"audio:{track['format_id']}")
-        builder.adjust(2)
-
-        await callback.message.edit_text("🎙 **Найдено несколько дубляжей!**\nВыберите язык:",
-                                         reply_markup=builder.as_markup())
-        await state.set_state(DownloadState.waiting_for_audio_choice)
-    else:
-        await download_and_send_video(callback.message, state, audio_format_id=None)
+    await callback.message.edit_text("🎙 **Выберите язык дубляжа:**", reply_markup=builder.as_markup())
+    await state.set_state(DownloadState.waiting_for_audio_choice)
 
 
 @dp.callback_query(DownloadState.waiting_for_audio_choice, F.data.startswith("audio:"))
 async def process_audio_choice(callback: types.CallbackQuery, state: FSMContext):
-    audio_format_id = callback.data.split(":")[1]
-    await download_and_send_video(callback.message, state, audio_format_id=audio_format_id)
-
-
-async def download_and_send_video(message: types.Message, state: FSMContext, audio_format_id: str = None):
+    audio_lang = callback.data.split(":")[1]
     data = await state.get_data()
     url = data['video_url']
     quality = data.get('chosen_quality', '720')
 
-    await message.edit_text(f"⏳ Скачиваю видео ({quality}p)... Это может занять пару минут.")
+    await callback.message.edit_text(f"⏳ Скачиваю видео ({quality}p)... Это займёт пару секунд.")
 
-    video_fmt = f"bestvideo[height<={quality}]"
-    audio_fmt = f"+{audio_format_id}" if audio_format_id else "+bestaudio"
+    res = await request_cobalt(url, is_audio_only=False, quality=quality, audio_lang=audio_lang)
 
-    # Гибкий селектор форматов: пробует собрать лучшее видео+аудио,
-    # а если не выходит — берет готовое видео с аудио или любое доступное
-    format_selector = (
-        f"{video_fmt}{audio_fmt}/"
-        f"bestvideo[height<={quality}]+bestaudio/"
-        f"best[height<={quality}]/"
-        f"b/best"
-    )
-
-    opts = {
-        'outtmpl': os.path.join(DOWNLOAD_PATH, f"%(id)s.%(ext)s"),
-        'format': format_selector,
-        'merge_output_format': 'mp4',
-        'quiet': True,
-    }
-    # ... оставшаяся часть функции без изменений
-
-    file_path = None
-    try:
-        loop = asyncio.get_running_loop()
-        file_path = await loop.run_in_executor(None, download_media, url, opts)
-
-        base_path = os.path.splitext(file_path)[0]
-        if os.path.exists(f"{base_path}.mp4"):
-            file_path = f"{base_path}.mp4"
-
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Файл не найден по пути: {file_path}")
-
-        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-
-        if file_size_mb > 49.5:
-            await message.edit_text(
-                f"⚠️ **Файл слишком большой ({file_size_mb:.1f} МБ)!**\n\n"
-                "Telegram Bot API на бесплатном сервере принимает файлы только **до 50 МБ**.\n"
-                "Попробуйте выбрать меньшее качество (480p или 360p).",
+    if res and res.get("status") in ["tunnel", "redirect"]:
+        download_url = res.get("url")
+        await callback.message.edit_text("⬆️ Отправляю файл в чат...")
+        try:
+            await callback.message.answer_video(video=download_url)
+            await db.increment_user_downloads(callback.from_user.id)
+            await callback.message.delete()
+        except Exception as e:
+            # Если файл превышает лимит отправки Telegram по URL, отдаем прямую ссылку
+            await callback.message.edit_text(
+                f"⚠️ **Видео готово, но файл слишком велик для прямого бота.**\n\n"
+                f"🔗 [Нажмите сюда, чтобы скачать видео]({download_url})",
                 parse_mode="Markdown"
             )
-            return
+    else:
+        err_msg = res.get("error", {}).get("code", "Неизвестная ошибка") if res else "Сервер не ответил"
+        await callback.message.edit_text(f"❌ Ошибка загрузки: `{err_msg}`", parse_mode="Markdown")
 
-        await message.edit_text("⬆️ Отправляю файл в чат...")
-        await message.answer_video(video=types.FSInputFile(file_path))
-
-        await db.increment_user_downloads(message.chat.id if hasattr(message, 'chat') else message.from_user.id)
-        await message.delete()
-    except Exception as e:
-        logging.error(f"Ошибка download_and_send_video: {e}")
-        await message.answer(f"❌ Ошибка загрузки: {e}")
-    finally:
-        if file_path and os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except Exception as e:
-                logging.error(f"Не удалось удалить файл {file_path}: {e}")
-        await state.clear()
+    await state.clear()
 
 
-# Задаем User-Agent современного браузера Chrome
-USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36'
-
-YOUTUBE_EXTRACTOR_ARGS = {
-    'youtube': {
-        'player_client': ['android', 'ios', 'mweb', 'tv', 'web'],
-    }
-}
-
-
-def extract_info(url, opts):
-    y_opts = opts.copy() if opts else {}
-
-    # Не запрашиваем конкретный формат при анализе метаданных
-    y_opts['format'] = 'best'
-    y_opts['extractor_args'] = YOUTUBE_EXTRACTOR_ARGS
-    y_opts['user_agent'] = USER_AGENT
-
-    if COOKIES_FILE:
-        y_opts['cookiefile'] = COOKIES_FILE
-
-    with yt_dlp.YoutubeDL(y_opts) as ydl:
-        return ydl.extract_info(url, download=False)
-
-
-def download_media(url, opts):
-    opts_copy = opts.copy()
-    opts_copy['extractor_args'] = YOUTUBE_EXTRACTOR_ARGS
-    opts_copy['user_agent'] = USER_AGENT
-
-    if COOKIES_FILE:
-        opts_copy['cookiefile'] = COOKIES_FILE
-
-    with yt_dlp.YoutubeDL(opts_copy) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-        if opts_copy.get('merge_output_format'):
-            ext = opts_copy['merge_output_format']
-            base = os.path.splitext(filename)[0]
-            filename = f"{base}.{ext}"
-        return filename
-
-def get_audio_tracks(formats):
-    tracks = []
-    seen_languages = set()
-    for fmt in formats:
-        vcodec = fmt.get('vcodec')
-        acodec = fmt.get('acodec')
-        if (vcodec == 'none' or not vcodec) and acodec and acodec != 'none':
-            lang_code = fmt.get('language') or fmt.get('language_preference')
-
-            if lang_code and str(lang_code).lower() != 'none':
-                lang_str = str(lang_code).upper()
-                if lang_str not in seen_languages:
-                    seen_languages.add(lang_str)
-                    note = str(fmt.get('format_note', '')).lower()
-                    tracks.append({
-                        'format_id': fmt.get('format_id'),
-                        'language': lang_str,
-                        'is_original': 'original' in note or 'main' in note
-                    })
-    return tracks
-
+# --- Точка входа ---
 
 async def main():
     threading.Thread(target=start_health_check_server, daemon=True).start()
-
     await db.init_db()
     await dp.start_polling(bot)
 
