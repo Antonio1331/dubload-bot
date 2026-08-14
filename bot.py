@@ -478,25 +478,36 @@ async def download_and_send_video(message: types.Message, state: FSMContext, aud
 
     await state.clear()
 
-
+YOUTUBE_EXTRACTOR_ARGS = {
+    'youtube': {
+        'player_client': ['android', 'ios', 'mweb'],
+        'skip': ['webpage']
+    }
+}
 # --- Хелперы с поддержкой cookies.txt ---
 
 def extract_info(url, opts):
     y_opts = opts.copy() if opts else {}
-    # Удаляем ключ 'format', если он случайно попал,
-    # так как при extract_info(download=False) он вызывает исключение "Requested format is not available"
     y_opts.pop('format', None)
+
+    # Добавляем обход клиентов YouTube
+    y_opts['extractor_args'] = YOUTUBE_EXTRACTOR_ARGS
 
     if COOKIES_FILE:
         y_opts['cookiefile'] = COOKIES_FILE
+
     with yt_dlp.YoutubeDL(y_opts) as ydl:
         return ydl.extract_info(url, download=False)
 
 
 def download_media(url, opts):
+    opts_copy = opts.copy()
+    opts_copy['extractor_args'] = YOUTUBE_EXTRACTOR_ARGS
+
     if COOKIES_FILE:
-        opts['cookiefile'] = COOKIES_FILE
-    with yt_dlp.YoutubeDL(opts) as ydl:
+        opts_copy['cookiefile'] = COOKIES_FILE
+
+    with yt_dlp.YoutubeDL(opts_copy) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
         return filename
