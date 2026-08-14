@@ -329,6 +329,7 @@ async def handle_media_request(message: types.Message, state: FSMContext):
             'skip_download': True,
             'extract_flat': False,
             'no_warnings': True,
+            'format': 'best',  # <-- Задает фоллбэк-формат для предотвращения ошибки "Requested format is not available"
         })
 
         await state.update_data(video_url=url, video_info=info)
@@ -440,7 +441,9 @@ async def download_and_send_video(message: types.Message, state: FSMContext, aud
 
     opts = {
         'outtmpl': os.path.join(DOWNLOAD_PATH, f"%(id)s.%(ext)s"),
-        'format': f"{video_fmt}{audio_fmt}/best[height<={quality}]/best",
+        # Если комбинация с конкретной дорожкой/качеством не найдется,
+        # yt_dlp автоматически откатится до наилучшего доступного видео с аудио
+        'format': f"{video_fmt}{audio_fmt}/bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best",
         'merge_output_format': 'mp4',
         'quiet': True,
     }
@@ -500,15 +503,23 @@ def get_audio_tracks(formats):
     tracks = []
     seen_languages = set()
     for fmt in formats:
-        if fmt.get('vcodec') == 'none' and fmt.get('acodec') != 'none':
-            lang_code = fmt.get('language', 'unknown')
-            if lang_code and lang_code not in seen_languages and lang_code != 'unknown':
-                seen_languages.add(lang_code)
-                tracks.append({
-                    'format_id': fmt.get('format_id'),
-                    'language': lang_code.upper(),
-                    'is_original': fmt.get('format_note') == 'original' or 'main' in fmt.get('format_note', '')
-                })
+        # Проверяем, что формат представляет собой только аудиопоток
+        vcodec = fmt.get('vcodec')
+        acodec = fmt.get('acodec')
+        if (vcodec == 'none' or not vcodec) and acodec and acodec != 'none':
+            lang_code = fmt.get('language') or fmt.get('language_preference')
+
+            # Если языковой код найден и мы его ещё не обрабатывали
+            if lang_code and str(lang_code).lower() != 'none':
+                lang_str = str(lang_code).upper()
+                if lang_str not in seen_languages:
+                    seen_languages.add(lang_str)
+                    note = str(fmt.get('format_note', '')).lower()
+                    tracks.append({
+                        'format_id': fmt.get('format_id'),
+                        'language': lang_str,
+                        'is_original': 'original' in note or 'main' in note
+                    })
     return tracks
 
 
