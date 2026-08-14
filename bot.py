@@ -20,7 +20,32 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 raw_admin_ids = os.getenv('ADMIN_IDS', '')
 ADMIN_IDS = [int(x.strip()) for x in raw_admin_ids.split(',') if x.strip().isdigit()]
 
-COBALT_API_URL = "https://api.cobalt.tools"
+# Список доступных экземпляров Cobalt (если один тупит, пробуем следующий)
+COBALT_INSTANCES = [
+    "https://api.cobalt.tools",
+    "https://cobalt.stream",
+]
+
+async def request_cobalt(url: str, is_audio_only: bool = False, quality: str = "720", audio_lang: str = "ru"):
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    payload = {
+        "url": url,
+        "videoQuality": quality if not is_audio_only else "720",
+        "downloadMode": "audio" if is_audio_only else "auto",
+        "youtubeAudioLanguage": audio_lang,
+    }
+    timeout = aiohttp.ClientTimeout(total=12)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for instance in COBALT_INSTANCES:
+            try:
+                async with session.post(instance, json=payload, headers=headers) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+            except Exception as e:
+                logging.warning(f"Инстанс {instance} не ответил: {e}")
+                continue
+    return None
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -60,12 +85,7 @@ class AdminState(StatesGroup):
     waiting_for_limit_data = State()
 
 
-# --- Взаимодействие с Cobalt API ---
-
 async def request_cobalt(url: str, is_audio_only: bool = False, quality: str = "720", audio_lang: str = "ru"):
-    """
-    Отправляет запрос к Cobalt API и возвращает структуру ответа.
-    """
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json"
@@ -75,14 +95,23 @@ async def request_cobalt(url: str, is_audio_only: bool = False, quality: str = "
         "url": url,
         "videoQuality": quality if not is_audio_only else "720",
         "downloadMode": "audio" if is_audio_only else "auto",
-        "youtubeAudioLanguage": audio_lang,  # Выбор языковой аудиодорожки
+        "youtubeAudioLanguage": audio_lang,
     }
 
-    async with aiohttp.ClientSession() as session:
+    # Ставим жесткий таймаут 15 секунд на подключение и ответ
+    timeout = aiohttp.ClientTimeout(total=15, connect=5)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         try:
-            async with session.post(COBALT_API_URL, json=payload, headers=headers, timeout=35) as resp:
-                data = await resp.json()
-                return data
+            async with session.post(COBALT_API_URL, json=payload, headers=headers) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                else:
+                    logging.error(f"Cobalt вернул статус: {resp.status}")
+                    return None
+        except asyncio.TimeoutError:
+            logging.error("Таймаут обращения к Cobalt API")
+            return {"error": {"code": "timeout"}}
         except Exception as e:
             logging.error(f"Ошибка обращения к Cobalt API: {e}")
             return None
@@ -415,27 +444,36 @@ async def process_audio_choice(callback: types.CallbackQuery, state: FSMContext)
     url = data['video_url']
     quality = data.get('chosen_quality', '720')
 
-    await callback.message.edit_text(f"⏳ Скачиваю видео ({quality}p)... Это займёт пару секунд.")
+    await callback.message.edit_text(f"⏳ Скачиваю видео ({quality}p)...")
 
+    # Передаем запрос с ограниченным временем ожидания
     res = await request_cobalt(url, is_audio_only=False, quality=quality, audio_lang=audio_lang)
 
     if res and res.get("status") in ["tunnel", "redirect"]:
         download_url = res.get("url")
-        await callback.message.edit_text("⬆️ Отправляю файл в чат...")
+        await callback.message.edit_text("⬆️ Отправляю файл...")
+
         try:
-            await callback.message.answer_video(video=download_url)
+            # Ограничиваем ожидание ответа от самого Telegram (10 секунд на попытку)
+            await asyncio.wait_for(
+                callback.message.answer_video(video=download_url),
+                timeout=10.0
+            )
             await db.increment_user_downloads(callback.from_user.id)
             await callback.message.delete()
-        except Exception as e:
-            # Если файл превышает лимит отправки Telegram по URL, отдаем прямую ссылку
+        except (asyncio.TimeoutError, Exception) as e:
+            # Если Telegram завис при отправке большого файла по URL — отдаем прямую ссылку!
             await callback.message.edit_text(
-                f"⚠️ **Видео готово, но файл слишком велик для прямого бота.**\n\n"
-                f"🔗 [Нажмите сюда, чтобы скачать видео]({download_url})",
-                parse_mode="Markdown"
+                f"🚀 **Видео готово к скачиванию!**\n\n"
+                f"Файл слишком большой для отправки в чат, нажмите для загрузки:\n"
+                f"🔗 [Скачать файл напрямую]({download_url})",
+                parse_mode="Markdown",
+                disable_web_page_preview=False
             )
+            await db.increment_user_downloads(callback.from_user.id)
     else:
-        err_msg = res.get("error", {}).get("code", "Неизвестная ошибка") if res else "Сервер не ответил"
-        await callback.message.edit_text(f"❌ Ошибка загрузки: `{err_msg}`", parse_mode="Markdown")
+        await callback.message.edit_text(
+            "❌ Сервер не ответил вовремя. Попробуйте ещё раз или выберите другое качество.")
 
     await state.clear()
 
