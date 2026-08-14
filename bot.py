@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import threading
+import shutil
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
@@ -27,14 +28,26 @@ dp = Dispatcher()
 DOWNLOAD_PATH = './downloads'
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
 
-# Проверяем наличие файла cookies.txt в корне проекта или в Secret Files Render
-# Проверяем наличие cookies в Secret Files Render или локально
-if os.path.exists('/etc/secrets/cookies.txt'):
-    COOKIES_FILE = '/etc/secrets/cookies.txt'
-elif os.path.exists('cookies.txt'):
-    COOKIES_FILE = 'cookies.txt'
-else:
-    COOKIES_FILE = None
+def prepare_cookies():
+    secret_path = '/etc/secrets/cookies.txt'
+    tmp_path = '/tmp/cookies.txt'
+    local_path = 'cookies.txt'
+
+    if os.path.exists(secret_path):
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            shutil.copy(secret_path, tmp_path)
+            logging.info("Файл cookies.txt успешно скопирован из /etc/secrets/ в /tmp/")
+            return tmp_path
+        except Exception as e:
+            logging.error(f"Ошибка копирования cookies из /etc/secrets/: {e}")
+            return None
+    elif os.path.exists(local_path):
+        return local_path
+    return None
+
+COOKIES_FILE = prepare_cookies()
 
 
 # --- HTTP Server для обхода таймаутов Render (Health Check) ---
@@ -46,11 +59,11 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Dubload Bot is running!")
 
     def log_message(self, format, *args):
-        return  # Отключаем логирование HTTP-запросов в консоль
+        return
 
 
 def start_health_check_server():
-    port = int(os.getenv("PORT", 10000))  # Render передает свой порт
+    port = int(os.getenv("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
     server.serve_forever()
 
@@ -84,8 +97,6 @@ async def check_user_subscriptions(user_id: int) -> list:
                 chat_id = raw_cid
 
             member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-            logging.info(f"Статус юзера {user_id} в канале {chat_id}: {member.status}")
-
             if member.status not in ['creator', 'administrator', 'member']:
                 not_subscribed.append(ch)
         except Exception as e:
@@ -290,14 +301,12 @@ async def admin_limit_process(message: types.Message, state: FSMContext):
 async def handle_media_request(message: types.Message, state: FSMContext):
     await db.add_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
 
-    # 1. Проверка подписки
     unsubbed = await check_user_subscriptions(message.from_user.id)
     if unsubbed:
         await message.answer("⚠️ **Сначала подпишитесь на каналы:**", reply_markup=get_sub_keyboard(unsubbed),
                              parse_mode="Markdown")
         return
 
-    # 2. Проверка дневного лимита
     allowed, left, total = await db.check_and_update_limit(message.from_user.id)
     if not allowed:
         await message.answer(
@@ -314,16 +323,19 @@ async def handle_media_request(message: types.Message, state: FSMContext):
         status_msg = await message.answer("⏳ Скачиваю TikTok...")
         out_tmpl = os.path.join(DOWNLOAD_PATH, f"%(id)s.%(ext)s")
         ydl_opts = {'outtmpl': out_tmpl, 'format': 'b', 'quiet': True}
+        file_path = None
         try:
             loop = asyncio.get_running_loop()
             file_path = await loop.run_in_executor(None, download_media, url, ydl_opts)
             await status_msg.edit_text("⬆️ Отправляю...")
             await message.answer_video(video=types.FSInputFile(file_path))
-            os.remove(file_path)
-            await status_msg.delete()
             await db.increment_user_downloads(message.from_user.id)
+            await status_msg.delete()
         except Exception as e:
             await status_msg.edit_text(f"❌ Ошибка TikTok: {e}")
+        finally:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
         return
 
     # YouTube
@@ -375,6 +387,7 @@ async def process_type_choice(callback: types.CallbackQuery, state: FSMContext):
             }],
             'quiet': True,
         }
+        file_path = None
         try:
             loop = asyncio.get_running_loop()
             file_path = await loop.run_in_executor(None, download_media, url, opts)
@@ -383,12 +396,14 @@ async def process_type_choice(callback: types.CallbackQuery, state: FSMContext):
 
             await callback.message.edit_text("⬆️ Отправляю аудио...")
             await callback.message.answer_audio(audio=types.FSInputFile(file_path), title=info.get('title'))
-            os.remove(file_path)
-            await callback.message.delete()
             await db.increment_user_downloads(callback.from_user.id)
+            await callback.message.delete()
         except Exception as e:
             await callback.message.edit_text(f"❌ Ошибка скачивания MP3: {e}")
-        await state.clear()
+        finally:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+            await state.clear()
 
     elif download_type == "video":
         builder = InlineKeyboardBuilder()
@@ -446,43 +461,50 @@ async def download_and_send_video(message: types.Message, state: FSMContext, aud
 
     opts = {
         'outtmpl': os.path.join(DOWNLOAD_PATH, f"%(id)s.%(ext)s"),
-        # Если комбинация с конкретной дорожкой/качеством не найдется,
-        # yt_dlp автоматически откатится до наилучшего доступного видео с аудио
         'format': f"{video_fmt}{audio_fmt}/bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best",
         'merge_output_format': 'mp4',
         'quiet': True,
     }
 
+    file_path = None
     try:
         loop = asyncio.get_running_loop()
         file_path = await loop.run_in_executor(None, download_media, url, opts)
 
-        if not file_path.endswith('.mp4') and os.path.exists(file_path.rsplit('.', 1)[0] + '.mp4'):
-            file_path = file_path.rsplit('.', 1)[0] + '.mp4'
+        base_path = os.path.splitext(file_path)[0]
+        if os.path.exists(f"{base_path}.mp4"):
+            file_path = f"{base_path}.mp4"
+
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Файл не найден по пути: {file_path}")
 
         file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
 
         if file_size_mb > 49.5:
-            os.remove(file_path)
             await message.edit_text(
                 f"⚠️ **Файл слишком большой ({file_size_mb:.1f} МБ)!**\n\n"
                 "Telegram Bot API на бесплатном сервере принимает файлы только **до 50 МБ**.\n"
-                "Попробуйте выбрать меньшее качество (например, 480p или 360p).",
+                "Попробуйте выбрать меньшее качество (480p или 360p).",
                 parse_mode="Markdown"
             )
-            await state.clear()
             return
 
         await message.edit_text("⬆️ Отправляю файл в чат...")
         await message.answer_video(video=types.FSInputFile(file_path))
 
-        os.remove(file_path)
-        await message.delete()
         await db.increment_user_downloads(message.chat.id if hasattr(message, 'chat') else message.from_user.id)
+        await message.delete()
     except Exception as e:
-        await message.edit_text(f"❌ Ошибка загрузки: {e}")
+        logging.error(f"Ошибка download_and_send_video: {e}")
+        await message.answer(f"❌ Ошибка загрузки: {e}")
+    finally:
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                logging.error(f"Не удалось удалить файл {file_path}: {e}")
+        await state.clear()
 
-    await state.clear()
 
 YOUTUBE_EXTRACTOR_ARGS = {
     'youtube': {
@@ -490,13 +512,11 @@ YOUTUBE_EXTRACTOR_ARGS = {
         'skip': ['webpage']
     }
 }
-# --- Хелперы с поддержкой cookies.txt ---
 
 def extract_info(url, opts):
     y_opts = opts.copy() if opts else {}
     y_opts.pop('format', None)
 
-    # Добавляем обход клиентов YouTube
     y_opts['extractor_args'] = YOUTUBE_EXTRACTOR_ARGS
 
     if COOKIES_FILE:
@@ -516,6 +536,10 @@ def download_media(url, opts):
     with yt_dlp.YoutubeDL(opts_copy) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
+        if opts_copy.get('merge_output_format'):
+            ext = opts_copy['merge_output_format']
+            base = os.path.splitext(filename)[0]
+            filename = f"{base}.{ext}"
         return filename
 
 
@@ -523,13 +547,11 @@ def get_audio_tracks(formats):
     tracks = []
     seen_languages = set()
     for fmt in formats:
-        # Проверяем, что формат представляет собой только аудиопоток
         vcodec = fmt.get('vcodec')
         acodec = fmt.get('acodec')
         if (vcodec == 'none' or not vcodec) and acodec and acodec != 'none':
             lang_code = fmt.get('language') or fmt.get('language_preference')
 
-            # Если языковой код найден и мы его ещё не обрабатывали
             if lang_code and str(lang_code).lower() != 'none':
                 lang_str = str(lang_code).upper()
                 if lang_str not in seen_languages:
@@ -544,7 +566,6 @@ def get_audio_tracks(formats):
 
 
 async def main():
-    # Запуск фонового веб-сервера для Render
     threading.Thread(target=start_health_check_server, daemon=True).start()
 
     await db.init_db()
