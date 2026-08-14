@@ -329,7 +329,6 @@ async def handle_media_request(message: types.Message, state: FSMContext):
             'skip_download': True,
             'extract_flat': False,
             'no_warnings': True,
-            'format': 'best',  # <-- Задает фоллбэк-формат для предотвращения ошибки "Requested format is not available"
         })
 
         await state.update_data(video_url=url, video_info=info)
@@ -484,6 +483,10 @@ async def download_and_send_video(message: types.Message, state: FSMContext, aud
 
 def extract_info(url, opts):
     y_opts = opts.copy() if opts else {}
+    # Удаляем ключ 'format', если он случайно попал,
+    # так как при extract_info(download=False) он вызывает исключение "Requested format is not available"
+    y_opts.pop('format', None)
+
     if COOKIES_FILE:
         y_opts['cookiefile'] = COOKIES_FILE
     with yt_dlp.YoutubeDL(y_opts) as ydl:
