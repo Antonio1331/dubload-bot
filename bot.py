@@ -28,7 +28,13 @@ DOWNLOAD_PATH = './downloads'
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
 
 # Проверяем наличие файла cookies.txt в корне проекта или в Secret Files Render
-COOKIES_FILE = 'cookies.txt' if os.path.exists('cookies.txt') else None
+# Проверяем наличие cookies в Secret Files Render или локально
+if os.path.exists('/etc/secrets/cookies.txt'):
+    COOKIES_FILE = '/etc/secrets/cookies.txt'
+elif os.path.exists('cookies.txt'):
+    COOKIES_FILE = 'cookies.txt'
+else:
+    COOKIES_FILE = None
 
 
 # --- HTTP Server для обхода таймаутов Render (Health Check) ---
